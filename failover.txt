@@ -1,0 +1,233 @@
+##########
+# VARS
+##########
+:local PRIPHYSINT "ether7"
+:local PRIISPINT "bridge-frontier"
+:local SECPHYSINT "ether1"
+:local SECISPINT "ether1"
+
+:local PRITYPE "DHCP"
+:local SECTYPE "DHCP"
+
+:local PRIIPSTATIC 0.0.0.0
+:local PRIGWSTATIC 0.0.0.0
+
+:local SECIPSTATIC 0.0.0.0
+:local SECGWSTATIC 0.0.0.0
+
+:local pingIP 1.1.1.1
+:local i 0  
+:local countUp 0  
+
+
+
+##########
+# setup pri and sec default routes (if they don't already exist)
+##########
+:do {
+	:local priRouteGateway [/ip route get [find comment="DEFAULT GATEWAY PRI"] gateway]
+} on-error { /ip route add comment="DEFAULT GATEWAY PRI" disabled=yes distance=2 gateway=99.99.99.99 }
+
+:do {
+	:local secRouteGateway [/ip route get [find comment="DEFAULT GATEWAY SEC"] gateway]
+} on-error { /ip route add comment="DEFAULT GATEWAY SEC" disabled=yes distance=2 gateway=99.99.99.99 }
+
+
+##########
+# get physical status of isp1 and isp2 (are they plugged in and linked?)
+##########
+:put "CHECK THAT PRI AND SEC ISP ARE BOTH ENABLED AND ACTIVE."
+:local isp1Status [/interface get [find name=$PRIPHYSINT] running] 
+:local isp2Status [/interface get [find name=$SECPHYSINT] running] 
+
+
+
+##########
+# Get the DHCP client IP and default gateway of both connections.
+# These can change at any time.
+# These will be used to update the default route for the secondary ISP
+##########
+# PRIMARY
+:local priIP
+:local priGW
+:if ($PRITYPE = "DHCP") do={
+	:set priIP [/ip dhcp-client get [find interface=$PRIISPINT] address]
+	:set priIP [:pick $priIP 0 [:find $priIP "/"]]
+	:set priGW [/ip dhcp-client get [find interface=$PRIISPINT] gateway]
+} else={
+	:set priIP $PRIIPSTATIC
+	:set priGW $PRIGWSTATIC
+}
+
+:put "priIP=$priIP"
+:put "priGW=$priGW"
+
+:if ($isp1Status) do={ 
+	/ip route set [find comment="DEFAULT GATEWAY PRI"] pref-src="$priIP" gateway="$priGW" 
+	:put "PRI DEFAULT GATEWAY SUCCESSFULLY SET."
+} else={
+	:put "isp1 LINK DOWN. NO DEFAULT GATEWAY UPDATE."
+	:beep 
+	:delay 1000ms
+	:beep 
+}
+
+
+
+
+# SECONDARY
+:local secIP
+:local secGW
+:if ($SECTYPE = "DHCP") do={
+	:set secIP [/ip dhcp-client get [find interface=$SECISPINT] address]
+	:set secIP [:pick $secIP 0 [:find $secIP "/"]]
+	:set secGW [/ip dhcp-client get [find interface=$SECISPINT] gateway]
+
+} else={
+	:set secIP $SECIPSTATIC
+	:set secGW $SECGWSTATIC
+}
+
+:put "secIP=$secIP"
+:put "secGW=$secGW"
+
+:if ($isp2Status) do={
+	/ip route set [find comment="DEFAULT GATEWAY SEC"] pref-src="$secIP" gateway="$secGW" 
+	:put "SEC DEFAULT GATEWAY SUCCESSFULLY SET."
+} else={
+	:put "isp2 LINK DOWN. NO DEFAULT GATEWAY UPDATE."
+	:beep 
+	:delay 2000ms
+	:beep 
+}
+
+
+##########
+# disable dhcp routes (if applicable) as they are controlled by this script now
+# "look at me.  I am the captain now"
+##########
+:if ($PRITYPE="DHCP") do={ /ip dhcp-client set [find interface=$PRIISPINT] add-default-route=no }
+:if ($SECTYPE="DHCP") do={ /ip dhcp-client set [find interface=$SECISPINT] add-default-route=no }
+
+
+
+
+##########
+# setup specific route to the pingIP (route thru primary always)
+##########
+# check if failover monitor route exists
+:local pingDst
+:do {
+	:set pingDst [/ip route get [find comment="FAILOVER MONITOR"] dst-address]
+} on-error { 
+	/ip route add comment="FAILOVER MONITOR" dst-address=$pingIP disabled=no distance=1 gateway=$priGW
+	:set pingDst $pingIP
+}
+
+# if the current pingIP does not match vars set in this script, then set it.
+:if ($pingDst != $pingIP) do={
+	/ip route set [find comment="FAILOVER MONITOR"] dst-address=$pingIP disabled=no distance=1 gateway=$priGW 
+}
+
+
+
+
+ 
+##########
+# both isp1 and isp2 are enabled and active...do the ping test 
+##########
+:if ($isp1Status && $isp2Status) do={ 
+	:put "PRI AND SEC ISP ARE BOTH ENABLED AND ACTIVE.  DO PING TEST."
+	:do {
+		:set i ($i + 1)  
+
+
+# v7 ping result parsing is different from v6
+### THIS IS v7 results
+		:local pingRes [/ping address=$pingIP interface=$PRIISPINT count=1 as-value]
+		:local pingTtl ($pingRes->"ttl")
+		:put ("pingTtl = ".$pingTtl)
+			
+		:if ($pingTtl > 0) do={
+			:set countUp ($countUp + 1)
+		}
+
+### THIS IS v6 results
+#		:if ([/ping address=$pingIP interface=$PRIISPINT interval=2 count=1]=1) do={
+#			:set countUp ($countUp + 1)
+#		}
+
+		:delay 1  
+	} while ($i < 5);
+
+	:put ("pings countUp = ".$countUp)
+	  
+	:if ($countUp=5) do={  
+		:put "Failover: Primary connection FULLY UP";
+		if ([/ip route get [find comment="DEFAULT GATEWAY PRI"] disabled]=true) do={  
+			/ip route set [find comment="DEFAULT GATEWAY PRI"] disabled=no  
+			/ip route set [find comment="DEFAULT GATEWAY SEC"] disabled=yes  
+			:log info "Failover: Primary ISP connection restored."  
+			/ip firewall connection remove [find]
+		}  
+	}  
+	:if ($countUp<5 && $countUp>0) do={  
+		:log warning "Failover: Primary connection PARTIALLY UP";  
+		:put "Failover: Primary connection PARTIALLY UP";  
+	}  
+	:if ($countUp=0) do={  
+		:log error "Failover: Primary connection DOWN";  
+		:put "Failover: Primary connection DOWN";  
+		:beep
+		if ([/ip route get [find comment="DEFAULT GATEWAY PRI"] disabled]=false) do={  
+			:log error "Failover: Failover to SECONDARY";  
+			:put "Failover: Failover to SECONDARY";  
+			/ip route set [find comment="DEFAULT GATEWAY PRI"] disabled=yes  
+			/ip route set [find comment="DEFAULT GATEWAY SEC"] disabled=no  
+			:log info "Failover: Secondary ISP now active."  
+			/ip firewall connection remove [find]
+		}  
+	}  
+} 
+ 
+ 
+##########
+# isp1 is hard down...switch default route to secondary 
+##########
+:if (!$isp1Status && $isp2Status) do={ 
+	:log error "Failover: Primary connection HARD DOWN.  No network link detected.  Failover to Secondary."; 
+	:put "Failover: Primary connection HARD DOWN.  No network link detected.  Failover to Secondary."; 
+	:beep
+
+	/ip route set [find comment="DEFAULT GATEWAY PRI"] disabled=yes
+	/ip route set [find comment="DEFAULT GATEWAY SEC"] disabled=no
+} 
+ 
+##########
+#isp2 is hard down...switch default route to primary 
+##########
+:if (!$isp2Status && $isp1Status) do={ 
+	:log error "Failover: Secondary connection HARD DOWN.  No network link detected.  Failover to Primary."; 
+	:put "Failover: Secondary connection HARD DOWN.  No network link detected.  Failover to Primary."; 
+	:beep 
+	:delay 300ms
+	:beep 
+
+	/ip route set [find comment="DEFAULT GATEWAY SEC"] disabled=yes
+	/ip route set [find comment="DEFAULT GATEWAY PRI"] disabled=no
+} 
+
+##########
+#both ISPs are down...all we can do is beep away into the void.
+##########
+:if (!$isp1Status && !$isp2Status) do={ 
+	:log error "Failover: Primary AND Secondary connections HARD DOWN.  No network link detected.  Beep into the void."; 
+	:put "Failover: Primary AND Secondary connections HARD DOWN.  No network link detected.  Beep into the void."; 
+	:beep 
+	:delay 200ms
+	:beep 
+	:delay 200ms
+	:beep 
+}
+
+
